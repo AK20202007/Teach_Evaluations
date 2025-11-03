@@ -1,3 +1,6 @@
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -5,8 +8,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 import json
 import re
+import os
 
 load_dotenv()
+
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
 # === Pydantic Schema ===
 class LessonFeedback(BaseModel):
@@ -27,7 +34,7 @@ model = "gemini-2.5-flash"
 llm = ChatGoogleGenerativeAI(model=model)
 parser = PydanticOutputParser(pydantic_object=LessonFeedback)
 
-# === Prompt for evaluation ===
+# === Prompt with strict JSON enforcement ===
 prompt = ChatPromptTemplate.from_messages([
     ("system", """
 You are an expert educator and evaluator. Evaluate a lesson explanation.
@@ -51,13 +58,13 @@ ALWAYS respond with VALID JSON only. Do NOT include explanations, markdown fence
     ("human", "{query}")
 ]).partial(format_instructions=parser.get_format_instructions())
 
-# === Helper functions ===
+# === Adapter function to map unexpected keys ===
 def adapt_feedback(raw_dict):
-    """Map model output to LessonFeedback schema, with defaults."""
+    """Map model output to the expected LessonFeedback schema."""
     return {
         "topic": raw_dict.get("topic", "Unknown Topic"),
         "numerical_grade": raw_dict.get("numerical_grade") or raw_dict.get("overall_score", 0),
-        "letter_grade": raw_dict.get("letter_grade", "A+"),
+        "letter_grade": raw_dict.get("letter_grade", "N/A"),
         "score_content": raw_dict.get("score_content") or raw_dict.get("content_score", 0),
         "score_organization": raw_dict.get("score_organization") or raw_dict.get("organization_score", 0),
         "score_mechanics": raw_dict.get("score_mechanics") or raw_dict.get("mechanics_score", 0),
@@ -68,56 +75,47 @@ def adapt_feedback(raw_dict):
         "mechanics_issues": raw_dict.get("mechanics_issues", []),
     }
 
+# === Helper function to extract JSON from raw LLM response ===
 def extract_json(text: str) -> str:
-    """Extract JSON object from raw text (handles fences or extra text)."""
+    """Extract JSON object from text, even if wrapped in markdown fences."""
     text = text.strip()
+    # regex to find {...}
     match = re.search(r"\{.*\}", text, re.DOTALL)
     return match.group(0) if match else "{}"
 
-# === New function: get AI-generated perfect explanation ===
-def perfect_example_for_topic(topic: str, reference_text: str):
-    """
-    Ask AI to generate the 'perfect' explanation for a topic,
-    roughly matching the length of the reference_text.
-    Returns both explanation text and LessonFeedback.
-    """
-    word_count = len(reference_text.split())
-    query = (
-        f"Topic: {topic}\n\n"
-        f"Please generate a perfect example explanation for this topic, "
-        f"roughly {word_count} words long, that would receive a perfect score "
-        f"if evaluated according to the rubric.\n\n"
-        f"After generating the explanation, evaluate it strictly using the rubric, "
-        f"and provide ONLY JSON following the LessonFeedback schema."
-    )
+# === Routes ===
+@app.get("/", response_class=HTMLResponse)
+def read_form(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
+@app.post("/evaluate", response_class=HTMLResponse)
+async def evaluate_lesson(request: Request, topic: str = Form(...), explanation: str = Form(...)):
+    if not explanation.strip():
+        return templates.TemplateResponse("index.html", {"request": request, "error": "Explanation cannot be empty."})
+
+    query = f"Topic: {topic}\n\nUser's explanation:\n{explanation}\n\nPlease evaluate according to the rubric."
     raw_response = llm.invoke(prompt.format_messages(query=query))
-    raw_text = getattr(raw_response, "content", raw_response)
 
-    # --- Extract JSON from raw response ---
+    # --- SAFELY EXTRACT RAW TEXT ---
+    raw_text = getattr(raw_response, "content", raw_response)
+    if not raw_text or not raw_text.strip():
+        return templates.TemplateResponse("index.html", {"request": request, "error": "Empty response from LLM."})
+
+    # --- Extract JSON safely ---
     json_text = extract_json(raw_text)
+
+    # --- Parse JSON safely ---
     try:
         raw_dict = json.loads(json_text)
     except json.JSONDecodeError:
         raw_dict = {}
 
+    # --- Adapt to schema ---
     adapted_dict = adapt_feedback(raw_dict)
     feedback = LessonFeedback(**adapted_dict)
 
-    # --- Extract explanation text from feedback strengths/weaknesses if needed ---
-    # Alternatively, you could have LLM output explanation separately; for now, we'll
-    # return the LLM raw content for user display.
-    return raw_text, feedback
+    return templates.TemplateResponse("index.html", {"request": request, "feedback": feedback})
 
-# === Example usage ===
 if __name__ == "__main__":
-    topic_input = input("Enter the topic: ").strip()
-    example_reference = input("Paste a reference explanation (used to approximate length): ").strip()
-
-    explanation_text, feedback = perfect_example_for_topic(topic_input, example_reference)
-
-    print("\n===== AI-PERFECT EXPLANATION =====")
-    print(explanation_text)
-
-    print("\n===== AI-PERFECT EXPLANATION FEEDBACK =====")
-    print(feedback.json(indent=4))
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
